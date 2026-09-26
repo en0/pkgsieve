@@ -1,0 +1,15 @@
+# Maintainer: Someone <someone@example.com>
+pkgname=oddhost
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Sources from an unusual host'
+arch=('any')
+url='https://example.com/oddhost'
+license=('MIT')
+source=("$pkgname-$pkgver.tar.gz::https://downloads.sketchy-cdn.example/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 thing "$pkgdir/usr/bin/thing"
+}

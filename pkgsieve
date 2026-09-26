@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+#
+# pkgsieve - sift AUR PKGBUILDs for supply-chain malware before you build them.
+#
+# Point it at a package directory (one containing a PKGBUILD) and it will:
+#   1. Check the package name against a live blocklist of known-compromised
+#      AUR packages (self-updating from lenucksi/aur-malware-check).
+#   2. Grep the PKGBUILD, *.install, and .SRCINFO for known payload indicators
+#      from the 2026 "Atomic Arch" campaign and generic red flags
+#      (curl|sh, base64 -d, eval, npm/bun install of malicious names, ...).
+#   3. Sanity-check that source= URLs point at reputable hosts.
+#
+# It refuses to stay silent when its own threat knowledge is stale: if the
+# embedded review date is older than the staleness window it demands an
+# interactive acknowledgement (skippable with --yes / PKGSIEVE_ASSUME_YES=1).
+#
+# Dependency-free: bash + coreutils + curl + (optional) pacman. No AUR helper.
+#
+# Exit codes:
+#   0  clean
+#   1  suspicious findings
+#   2  usage / environment error
+#   3  aborted at staleness prompt
+#
+# License: MIT (see LICENSE). Author: Ian Laird.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Maintenance metadata. BUMP LAST_REVIEWED whenever you eyeball the threat
+# landscape and confirm the detection rules below are still current.
+# Format: YYYY-MM-DD.
+# ---------------------------------------------------------------------------
+readonly LAST_REVIEWED="2026-09-25"
+readonly STALE_AFTER_DAYS="${PKGSIEVE_STALE_DAYS:-30}"
+
+readonly VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Blocklist source (data only; we do not run their tool).
+# ---------------------------------------------------------------------------
+readonly BLOCKLIST_REPO="lenucksi/aur-malware-check"
+readonly BLOCKLIST_BRANCH="master"
+# Package lists we consume, relative to the repo root.
+readonly BLOCKLIST_PATHS=(
+    "data/campaigns/aur-infected/packages.txt"
+    "data/campaigns/aur-infected/packages-extra.txt"
+    "data/campaigns/chaos-rat/packages.txt"
+    "data/campaigns/russian-spam/packages.txt"
+)
+readonly NPM_PAYLOAD_PATH="data/campaigns/aur-infected/npm-packages.txt"
+
+readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pkgsieve"
+readonly BLOCKLIST_FILE="$CACHE_DIR/blocklist.txt"
+readonly NPM_PAYLOAD_FILE="$CACHE_DIR/npm-payloads.txt"
+readonly SHA_FILE="$CACHE_DIR/blocklist.sha"
+
+# Bundled fallback payload names, so a fresh checkout with no network still
+# catches the headline 2026 campaign indicators.
+readonly FALLBACK_NPM_PAYLOADS=(
+    atomic-lockfile js-digest lockfile-js nextfile-js
+)
+
+# Hosts we treat as reputable for source= URLs. Anything else is flagged for
+# a human to eyeball (not an automatic fail).
+readonly TRUSTED_SOURCE_HOSTS=(
+    github.com codeload.github.com raw.githubusercontent.com
+    gitlab.com git.sr.ht sr.ht bitbucket.org
+    pypi.org files.pythonhosted.org
+    sourceforge.net freedesktop.org gnome.org kde.org
+    archlinux.org gnu.org nongnu.org savannah.gnu.org
+    crates.io static.crates.io npmjs.org registry.npmjs.org
+    apache.org kernel.org launchpad.net
+)
+
+# ---------------------------------------------------------------------------
+# Output helpers (color only when attached to a terminal).
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
+    C_BLU=$'\033[0;34m'; C_BLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+    C_RED=; C_GRN=; C_YEL=; C_BLU=; C_BLD=; C_RST=
+fi
+
+info()  { printf '%s[*]%s %s\n'  "$C_BLU" "$C_RST" "$*"; }
+ok()    { printf '%s[+]%s %s\n'  "$C_GRN" "$C_RST" "$*"; }
+warn()  { printf '%s[!]%s %s\n'  "$C_YEL" "$C_RST" "$*" >&2; }
+fail()  { printf '%s[x]%s %s\n'  "$C_RED" "$C_RST" "$*" >&2; }
+die()   { fail "$*"; exit 2; }
+
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${C_BLD}pkgsieve${C_RST} v$VERSION - sift AUR PKGBUILDs for supply-chain malware.
+
+USAGE:
+    pkgsieve [OPTIONS] <package-dir> [<package-dir>...]
+    pkgsieve --installed
+    pkgsieve --update
+
+ARGUMENTS:
+    <package-dir>   Directory containing a PKGBUILD to scan (e.g. ~/.aur/idasen).
+
+OPTIONS:
+    --installed     Scan currently-installed foreign packages against the
+                    blocklist instead of scanning a directory.
+    --update        Refresh the cached blocklist from upstream and exit.
+    --no-update     Skip the automatic blocklist refresh for this run.
+    -y, --yes       Assume "yes" to the staleness acknowledgement (for
+                    non-interactive use, e.g. piping into makepkg).
+    -q, --quiet     Only print warnings and failures.
+    -h, --help      Show this help.
+    --version       Show version.
+
+EXIT CODES:
+    0 clean   1 suspicious   2 usage/env error   3 aborted at staleness prompt
+
+EXAMPLES:
+    pkgsieve ~/.aur/idasen && makepkg -sirc   # gate a build on a clean scan
+    pkgsieve --installed                      # audit what is already on the box
+    pkgsieve --update                         # refresh the blocklist
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Staleness guard: force a human to re-review threat rules periodically.
+# ---------------------------------------------------------------------------
+days_since() {
+    # $1 = YYYY-MM-DD. Prints whole days between then and now (>=0), or empty.
+    local then_s now_s
+    then_s=$(date -d "$1" +%s 2>/dev/null) || return 1
+    now_s=$(date +%s)
+    printf '%d' $(( (now_s - then_s) / 86400 ))
+}
+
+check_staleness() {
+    local age
+    age=$(days_since "$LAST_REVIEWED") || {
+        warn "Could not parse LAST_REVIEWED='$LAST_REVIEWED'; treating as stale."
+        age=99999
+    }
+    if (( age < STALE_AFTER_DAYS )); then
+        return 0
+    fi
+
+    warn "pkgsieve detection rules were last reviewed $age days ago (>$STALE_AFTER_DAYS)."
+    warn "Threat landscape moves fast. Please review the sources before trusting a PASS:"
+    warn "  https://github.com/$BLOCKLIST_REPO"
+    warn "  https://archlinux.org/news/"
+
+    if [[ "${ASSUME_YES:-0}" == "1" ]]; then
+        warn "Proceeding anyway (--yes / PKGSIEVE_ASSUME_YES set)."
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        die "Stale rules and no TTY to acknowledge. Re-run with --yes or bump LAST_REVIEWED."
+    fi
+
+    local reply
+    read -r -p "Acknowledge staleness and continue anyway? [y/N] " reply
+    case "$reply" in
+        [yY]|[yY][eE][sS]) warn "Acknowledged. Consider bumping LAST_REVIEWED after review." ;;
+        *) fail "Aborted. Review the sources, then bump LAST_REVIEWED in pkgsieve."; exit 3 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Blocklist management: self-update keyed on the upstream commit SHA.
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+remote_head_sha() {
+    have curl || return 1
+    curl -fsSL "https://api.github.com/repos/$BLOCKLIST_REPO/commits/$BLOCKLIST_BRANCH" 2>/dev/null \
+        | grep -m1 '"sha"' | cut -d'"' -f4
+}
+
+fetch_blocklist() {
+    # Pull every configured package list at the given ref into the cache.
+    local ref="$1" tmp path url
+    tmp=$(mktemp) || return 1
+    : > "$tmp"
+    for path in "${BLOCKLIST_PATHS[@]}"; do
+        url="https://raw.githubusercontent.com/$BLOCKLIST_REPO/$ref/$path"
+        curl -fsSL "$url" 2>/dev/null >> "$tmp" || warn "could not fetch $path"
+        printf '\n' >> "$tmp"
+    done
+    # Strip comments/blank lines, dedupe, sort.
+    grep -vE '^\s*#|^\s*$' "$tmp" | sort -u > "$BLOCKLIST_FILE"
+    rm -f "$tmp"
+
+    url="https://raw.githubusercontent.com/$BLOCKLIST_REPO/$ref/$NPM_PAYLOAD_PATH"
+    curl -fsSL "$url" 2>/dev/null | grep -vE '^\s*#|^\s*$' | sort -u > "$NPM_PAYLOAD_FILE" || true
+}
+
+update_blocklist() {
+    # Returns 0 if a usable blocklist exists afterwards.
+    mkdir -p "$CACHE_DIR" || die "cannot create cache dir $CACHE_DIR"
+
+    if ! have curl; then
+        warn "curl not found; cannot refresh blocklist. Using cache/fallback."
+        return 1
+    fi
+
+    local remote local_sha
+    remote=$(remote_head_sha)
+    local_sha=$(cat "$SHA_FILE" 2>/dev/null || echo "")
+
+    if [[ -z "$remote" ]]; then
+        warn "Could not reach upstream to check for blocklist updates."
+        return 1
+    fi
+
+    if [[ "$remote" == "$local_sha" && -s "$BLOCKLIST_FILE" ]]; then
+        info "Blocklist up to date (${remote:0:12})."
+        return 0
+    fi
+
+    info "Updating blocklist ${local_sha:0:12}..${remote:0:12}"
+    if fetch_blocklist "$remote" && [[ -s "$BLOCKLIST_FILE" ]]; then
+        printf '%s\n' "$remote" > "$SHA_FILE"
+        ok "Blocklist updated: $(wc -l < "$BLOCKLIST_FILE") packages."
+        return 0
+    fi
+
+    warn "Blocklist update failed; keeping previous cache if any."
+    [[ -s "$BLOCKLIST_FILE" ]]
+}
+
+ensure_npm_payloads() {
+    # Guarantee a payload-name list exists (cache or bundled fallback).
+    if [[ ! -s "$NPM_PAYLOAD_FILE" ]]; then
+        mkdir -p "$CACHE_DIR"
+        printf '%s\n' "${FALLBACK_NPM_PAYLOADS[@]}" > "$NPM_PAYLOAD_FILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Scans. Each returns the number of findings it added (via global FINDINGS).
+# ---------------------------------------------------------------------------
+FINDINGS=0
+finding() { fail "$*"; FINDINGS=$((FINDINGS + 1)); }
+
+scan_blocklist_name() {
+    local pkgname="$1"
+    [[ -s "$BLOCKLIST_FILE" ]] || { warn "no blocklist available; skipping name check"; return; }
+    if grep -qxF "$pkgname" "$BLOCKLIST_FILE"; then
+        finding "Package name '$pkgname' is on the known-malicious blocklist."
+    fi
+}
+
+scan_payloads() {
+    # Grep build/install files for campaign payloads and generic red flags.
+    local dir="$1"
+    local files=()
+    local f
+    for f in "$dir"/PKGBUILD "$dir"/*.install "$dir"/.SRCINFO; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    (( ${#files[@]} )) || return
+
+    # 1) Malicious npm/bun payload package names (from the blocklist campaign).
+    ensure_npm_payloads
+    local name
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if grep -nFw "$name" "${files[@]}" >/dev/null 2>&1; then
+            finding "Payload package name '$name' referenced in build files:"
+            grep -nFw --color=never "$name" "${files[@]}" | sed 's/^/      /' >&2
+        fi
+    done < "$NPM_PAYLOAD_FILE"
+
+    # 2) npm/bun/yarn/pnpm install invocations inside a PKGBUILD are a strong
+    #    smell for this campaign (legit Arch python/rust pkgs don't need them).
+    if grep -nEw '(npm|bun|yarn|pnpm)[[:space:]]+(install|add|i|dlx|x)' "${files[@]}" >/dev/null 2>&1; then
+        finding "Node package-manager install invoked in build files:"
+        grep -nEw --color=never '(npm|bun|yarn|pnpm)[[:space:]]+(install|add|i|dlx|x)' "${files[@]}" \
+            | sed 's/^/      /' >&2
+    fi
+
+    # 3) Generic obfuscation / remote-exec red flags. Each entry is
+    #    "<regex><TAB><description>"; a tab is used as the delimiter because
+    #    the regexes themselves contain '|' (alternation / literal pipe).
+    local pat desc entry
+    local tab=$'\t'
+    local -a patterns=(
+        "curl[^|;]*\\|[[:space:]]*(ba)?sh${tab}Remote script piped straight into a shell (curl | sh)"
+        "wget[^|;]*\\|[[:space:]]*(ba)?sh${tab}Remote script piped straight into a shell (wget | sh)"
+        "base64[[:space:]]+(-d|--decode)${tab}base64-decoded blob executed"
+        "eval[[:space:]]+\"?\\\$\\(${tab}eval of command substitution"
+        "bash[[:space:]]+-c[[:space:]]+\"?\\\$\\(${tab}bash -c on dynamic content"
+        "/dev/tcp/${tab}Raw /dev/tcp network socket"
+        "python[0-9.]*[[:space:]]+-c[[:space:]].*(urllib|requests|socket)${tab}Inline python network one-liner"
+    )
+    for entry in "${patterns[@]}"; do
+        pat="${entry%%${tab}*}"; desc="${entry#*${tab}}"
+        if grep -nE "$pat" "${files[@]}" >/dev/null 2>&1; then
+            finding "$desc:"
+            grep -nE --color=never "$pat" "${files[@]}" | sed 's/^/      /' >&2
+        fi
+    done
+}
+
+host_of() {
+    # Extract host from a URL, stripping scheme, userinfo, VCS prefixes, port.
+    local url="$1"
+    url="${url##*::}"                 # strip makepkg "name::url" prefix
+    url="${url#*+}"                   # strip git+, svn+, etc.
+    url="${url#*://}"                 # strip scheme
+    url="${url%%/*}"                  # keep host[:port][@...]
+    url="${url##*@}"                  # strip userinfo
+    url="${url%%:*}"                  # strip port
+    printf '%s' "$url"
+}
+
+scan_sources() {
+    local dir="$1"
+    local pkgbuild="$dir/PKGBUILD"
+    [[ -f "$pkgbuild" ]] || return
+
+    # Extract source arrays without executing the PKGBUILD. Grab URL-ish tokens.
+    local urls host trusted h
+    urls=$(grep -oE '(https?|ftp|git\+https?|svn\+https?|hg\+https?)://[^"'"'"' )]+' "$pkgbuild" 2>/dev/null | sort -u)
+    [[ -z "$urls" ]] && return
+
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        host=$(host_of "$u")
+        [[ -z "$host" ]] && continue
+        trusted=0
+        for h in "${TRUSTED_SOURCE_HOSTS[@]}"; do
+            if [[ "$host" == "$h" || "$host" == *."$h" ]]; then trusted=1; break; fi
+        done
+        if (( ! trusted )); then
+            finding "source host not in trusted list: $host"
+            fail "      $u"
+        fi
+    done <<< "$urls"
+}
+
+pkgname_from_dir() {
+    # Prefer .SRCINFO (declarative), fall back to PKGBUILD assignment.
+    local dir="$1" name=""
+    if [[ -f "$dir/.SRCINFO" ]]; then
+        name=$(grep -m1 -E '^\s*pkgname\s*=' "$dir/.SRCINFO" | sed -E 's/.*=\s*//; s/\s*$//')
+    fi
+    if [[ -z "$name" && -f "$dir/PKGBUILD" ]]; then
+        name=$(grep -m1 -E '^\s*pkgname=' "$dir/PKGBUILD" \
+            | sed -E 's/^\s*pkgname=//; s/^[("'"'"']//; s/["'"'"')]\s*$//' \
+            | awk '{print $1}')
+    fi
+    printf '%s' "$name"
+}
+
+scan_dir() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        die "not a directory: $dir"
+    fi
+    if [[ ! -f "$dir/PKGBUILD" ]]; then
+        die "no PKGBUILD in: $dir"
+    fi
+
+    local pkgname before="$FINDINGS"
+    pkgname=$(pkgname_from_dir "$dir")
+    info "Scanning ${C_BLD}${pkgname:-?}${C_RST} ($dir)"
+
+    [[ -n "$pkgname" ]] && scan_blocklist_name "$pkgname"
+    scan_payloads "$dir"
+    scan_sources "$dir"
+
+    if (( FINDINGS == before )); then
+        ok "clean: ${pkgname:-$dir}"
+    else
+        fail "$((FINDINGS - before)) finding(s) in ${pkgname:-$dir}"
+    fi
+}
+
+scan_installed() {
+    have pacman || die "--installed requires pacman."
+    [[ -s "$BLOCKLIST_FILE" ]] || die "no blocklist available for --installed scan."
+    info "Checking installed foreign packages against blocklist..."
+    local installed hits
+    installed=$(pacman -Qmq 2>/dev/null | sort -u)
+    if [[ -z "$installed" ]]; then
+        ok "no foreign (AUR) packages installed."
+        return
+    fi
+    hits=$(comm -12 <(printf '%s\n' "$installed") "$BLOCKLIST_FILE")
+    if [[ -z "$hits" ]]; then
+        ok "clean: none of $(printf '%s\n' "$installed" | wc -l) foreign packages are blocklisted."
+    else
+        while IFS= read -r p; do finding "INSTALLED and blocklisted: $p"; done <<< "$hits"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+main() {
+    local mode="scan" quiet=0 do_update=1
+    ASSUME_YES="${PKGSIEVE_ASSUME_YES:-0}"
+    local -a targets=()
+
+    while (( $# )); do
+        case "$1" in
+            -h|--help)     usage; exit 0 ;;
+            --version)     printf 'pkgsieve %s\n' "$VERSION"; exit 0 ;;
+            --installed)   mode="installed" ;;
+            --update)      mode="update" ;;
+            --no-update)   do_update=0 ;;
+            -y|--yes)      ASSUME_YES=1 ;;
+            -q|--quiet)    quiet=1 ;;
+            --)            shift; while (( $# )); do targets+=("$1"); shift; done; break ;;
+            -*)            die "unknown option: $1 (see --help)" ;;
+            *)             targets+=("$1") ;;
+        esac
+        shift
+    done
+
+    if (( quiet )); then info() { :; }; ok() { :; }; fi
+
+    check_staleness
+
+    case "$mode" in
+        update)
+            update_blocklist && ok "Done." || die "Update failed and no cached blocklist present."
+            exit 0
+            ;;
+        installed)
+            (( do_update )) && update_blocklist || true
+            scan_installed
+            ;;
+        scan)
+            (( ${#targets[@]} )) || { usage; die "no package directory given."; }
+            (( do_update )) && update_blocklist || true
+            local t
+            for t in "${targets[@]}"; do scan_dir "$t"; done
+            ;;
+    esac
+
+    echo
+    if (( FINDINGS == 0 )); then
+        printf '%s[+]%s %sPASS%s - no indicators found.\n' "$C_GRN" "$C_RST" "$C_BLD" "$C_RST"
+        exit 0
+    else
+        printf '%s[x]%s %sFAIL%s - %s total finding(s). Do NOT build without manual review.\n' \
+            "$C_RED" "$C_RST" "$C_BLD" "$C_RST" "$FINDINGS" >&2
+        exit 1
+    fi
+}
+
+main "$@"

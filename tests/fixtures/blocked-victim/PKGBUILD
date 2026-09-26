@@ -1,0 +1,15 @@
+# Maintainer: Someone <someone@example.com>
+pkgname=blocked-victim
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='This name is on the blocklist in the test harness'
+arch=('any')
+url='https://github.com/example/blocked-victim'
+license=('MIT')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/example/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 thing "$pkgdir/usr/bin/thing"
+}

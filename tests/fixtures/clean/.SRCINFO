@@ -1,0 +1,12 @@
+pkgbase = cleanpkg
+	pkgdesc = A perfectly ordinary package
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/example/cleanpkg
+	arch = any
+	license = MIT
+	depends = python
+	source = cleanpkg-1.0.0.tar.gz::https://github.com/example/cleanpkg/archive/v1.0.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = cleanpkg

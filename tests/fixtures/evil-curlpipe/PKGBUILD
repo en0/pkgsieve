@@ -1,0 +1,16 @@
+# Maintainer: Totally Legit <legit@example.com>
+pkgname=evil-curlpipe
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Fetches a remote installer'
+arch=('any')
+url='https://github.com/example/evil-curlpipe'
+license=('MIT')
+install=evil-curlpipe.install
+source=("$pkgname-$pkgver.tar.gz::https://github.com/example/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 bin/thing "$pkgdir/usr/bin/thing"
+}

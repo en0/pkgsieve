@@ -1,0 +1,20 @@
+# Maintainer: Totally Legit <legit@example.com>
+pkgname=evil-npm-payload
+pkgver=2.3.1
+pkgrel=1
+pkgdesc='Looks fine, is not'
+arch=('any')
+url='https://github.com/example/evil-npm-payload'
+license=('MIT')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/example/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  npm install atomic-lockfile
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 bin/thing "$pkgdir/usr/bin/thing"
+}
