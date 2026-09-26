@@ -1,6 +1,6 @@
 # Maintainer: Ian Laird <irlaird@gmail.com>
 pkgname=pkgsieve
-pkgver=0.1.0
+pkgver=0.1.5
 pkgrel=1
 pkgdesc='Sift AUR PKGBUILDs for supply-chain malware before you build them'
 arch=('any')

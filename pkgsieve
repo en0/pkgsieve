@@ -70,7 +70,10 @@ readonly TRUSTED_SOURCE_HOSTS=(
     sourceforge.net freedesktop.org gnome.org kde.org
     archlinux.org gnu.org nongnu.org savannah.gnu.org
     crates.io static.crates.io npmjs.org registry.npmjs.org
-    apache.org kernel.org launchpad.net
+    apache.org kernel.org launchpad.net brave.com
+    launcher.mojang.com mojang.com zsa.io
+    oryx.nyc3.cdn.digitaloceanspaces.com
+    aws.amazon.com kiro.dev prod.download.cli.kiro.dev
 )
 
 # ---------------------------------------------------------------------------
