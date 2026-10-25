@@ -108,3 +108,18 @@ yourself.** A PASS means "no known indicators found," not "safe."
 ## License
 
 MIT. See [LICENSE](LICENSE). Community tool, no warranty — use at your own risk.
+
+## To update this package
+
+Make changes to pkgsieve. For example, adding new `TRUSTED_SOURCE_HOSTS`. Or, adding untrusted
+`FALLBACK_NPM_PAYLOADS`.
+
+```bash
+readonly LAST_REVIEWED="2026-10-25"
+...
+
+readonly VERSION="0.1.6"
+```
+
+Then, update the `pkgver` in `PKGBUILD` to match the `VERSION` in `pkgsieve`
+

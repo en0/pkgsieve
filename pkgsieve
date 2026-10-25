@@ -34,7 +34,7 @@ set -uo pipefail
 readonly LAST_REVIEWED="2026-10-25"
 readonly STALE_AFTER_DAYS="${PKGSIEVE_STALE_DAYS:-30}"
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.6"
 
 # ---------------------------------------------------------------------------
 # Blocklist source (data only; we do not run their tool).
