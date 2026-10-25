@@ -31,7 +31,7 @@ set -uo pipefail
 # landscape and confirm the detection rules below are still current.
 # Format: YYYY-MM-DD.
 # ---------------------------------------------------------------------------
-readonly LAST_REVIEWED="2026-09-25"
+readonly LAST_REVIEWED="2026-10-25"
 readonly STALE_AFTER_DAYS="${PKGSIEVE_STALE_DAYS:-30}"
 
 readonly VERSION="0.1.0"
@@ -74,6 +74,7 @@ readonly TRUSTED_SOURCE_HOSTS=(
     launcher.mojang.com mojang.com zsa.io
     oryx.nyc3.cdn.digitaloceanspaces.com
     aws.amazon.com kiro.dev prod.download.cli.kiro.dev
+    dl.suckless.org tools.suckless.org
 )
 
 # ---------------------------------------------------------------------------
