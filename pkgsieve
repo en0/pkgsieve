@@ -34,7 +34,7 @@ set -uo pipefail
 readonly LAST_REVIEWED="2026-10-25"
 readonly STALE_AFTER_DAYS="${PKGSIEVE_STALE_DAYS:-30}"
 
-readonly VERSION="0.1.6"
+readonly VERSION="0.1.7"
 
 # ---------------------------------------------------------------------------
 # Blocklist source (data only; we do not run their tool).
@@ -74,7 +74,7 @@ readonly TRUSTED_SOURCE_HOSTS=(
     launcher.mojang.com mojang.com zsa.io
     oryx.nyc3.cdn.digitaloceanspaces.com
     aws.amazon.com kiro.dev prod.download.cli.kiro.dev
-    dl.suckless.org tools.suckless.org
+    dl.suckless.org tools.suckless.org st.suckless.org
 )
 
 # ---------------------------------------------------------------------------
